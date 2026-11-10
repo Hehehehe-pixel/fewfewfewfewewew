@@ -1,0 +1,1107 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Photo Date Editor</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  :root { --bg:#f6f7f9; --card:#fff; --text:#1d2330; --muted:#667085; --line:#d9dde5; --accent:#2f6fed; }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) { --bg:#14171c; --card:#1d2128; --text:#e8ebf0; --muted:#98a2b3; --line:#323844; --accent:#6b9bff; }
+  }
+  :root[data-theme="dark"] { --bg:#14171c; --card:#1d2128; --text:#e8ebf0; --muted:#98a2b3; --line:#323844; --accent:#6b9bff; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font:14px/1.45 system-ui, sans-serif; }
+  main { max-width:1100px; margin:0 auto; padding:20px 16px 40px; }
+  h1 { font-size:20px; margin:0 0 4px; }
+  .sub { color:var(--muted); margin:0 0 16px; }
+  .controls { display:flex; flex-wrap:wrap; gap:12px 18px; align-items:end; background:var(--card);
+    border:1px solid var(--line); border-radius:10px; padding:14px; margin-bottom:14px; }
+  label { display:flex; flex-direction:column; gap:4px; font-size:12px; color:var(--muted); }
+  label.check { flex-direction:row; align-items:center; gap:6px; font-size:13px; color:var(--text); }
+  input, select, button { font:inherit; color:var(--text); background:var(--bg); border:1px solid var(--line);
+    border-radius:6px; padding:6px 10px; }
+  button { cursor:pointer; }
+  button.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
+  button:disabled { opacity:.5; cursor:default; }
+  .drop { border:2px dashed var(--line); border-radius:10px; padding:14px; text-align:center; color:var(--muted);
+    margin-bottom:14px; }
+  .drop.over { border-color:var(--accent); color:var(--accent); }
+  .status { min-height:20px; margin:0 0 10px; }
+  .grid { display:grid; grid-template-columns:1fr 1fr; gap:14px; }
+  @media (max-width:700px) { .grid { grid-template-columns:1fr; } }
+  figure { margin:0; background:var(--card); border:1px solid var(--line); border-radius:10px; padding:10px; }
+  figcaption { font-weight:600; margin-bottom:8px; }
+  canvas { width:100%; height:auto; display:block; border-radius:6px; }
+  #before.drawing { cursor:crosshair; }
+  .wrap { position:relative; }
+  #sel { position:absolute; border:2px solid var(--accent); background:rgba(47,111,237,.15); pointer-events:none; display:none; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Photo Date Editor</h1>
+  <p class="sub">Replaces the date stamped above the yellow line on a photo. Open, drop or paste (Ctrl+V) a photo.</p>
+
+  <div class="drop" id="drop">Drop a photo here, paste one with Ctrl+V, or <button id="pick">choose a file</button>
+    <input type="file" id="file" accept="image/*" hidden></div>
+
+  <div class="controls">
+    <label>Date on the photo now <input type="date" id="oldDate"></label>
+    <label>New date <input type="date" id="newDate"></label>
+    <label>Output size
+      <select id="scale"><option value="1">1x</option><option value="2">2x</option><option value="3">3x</option><option value="4">4x</option></select>
+    </label>
+    <label class="check"><input type="checkbox" id="manual"> Draw the box myself</label>
+    <button class="primary" id="download" disabled>Download</button>
+    <button id="copy" disabled>Copy edited image</button>
+  </div>
+
+  <p class="status" id="status">Open a photo to start.</p>
+
+  <div class="grid">
+    <figure><figcaption>Before</figcaption><div class="wrap"><canvas id="before"></canvas><div id="sel"></div></div></figure>
+    <figure><figcaption>After</figcaption><canvas id="after"></canvas></figure>
+  </div>
+</main>
+
+<script>
+// The stamp app's font: Barlow Condensed Regular, narrowed a little more.
+const FONT = '400 100px "Barlow Condensed"'
+const NARROW = 0.8
+// Enlarged photos make the old stamp's letters softer and thicker, so the new
+// date is written a little bolder at bigger output sizes to match.
+const WEIGHT = { 1: 400, 2: 500, 3: 500, 4: 500 }
+const withWeight = (font, weight) => font.replace(/^\d+/, weight)
+
+const SAMPLE_DATE = '2026-07-04'
+const weekday = new Intl.DateTimeFormat('en-GB', { weekday: 'long', timeZone: 'UTC' })
+
+function loadImage(src) {
+  return new Promise((resolve, reject) => {
+    const img = new Image()
+    img.onload = () => resolve(img)
+    img.onerror = reject
+    img.src = src
+  })
+}
+
+// The date's text box, worked out from its yellow underline. Measured on stamp
+// photos: for a 124px line the digits are 13px tall, start 1px in from the
+// line's left end and sit with their baseline 8px above the line. The text is
+// kept 2px short of the line's right end so it never runs past the line.
+function boxFromLine(lineX, lineY, len, W, H) {
+  const k = len / 124
+  const box = {
+    x: Math.round(lineX + k),
+    y: Math.round(lineY - 21 * k),
+    w: Math.min(Math.round(len - 3 * k), W - Math.round(lineX + k)),
+    h: Math.round(13 * k)
+  }
+  // Clear a little more than the text so no edges of the old date are left
+  // (wider sideways, as the line's ends can be faint on small photos, and
+  // higher, as a photo stretched taller puts the text's top further up).
+  const pad = Math.max(1, Math.round(2 * k)),
+    side = Math.max(2, Math.round(5 * k)),
+    above = Math.max(2, Math.round(6 * k))
+  const cx = Math.max(0, box.x - side),
+    cy = Math.max(0, box.y - above)
+  box.clear = {
+    x: cx,
+    y: cy,
+    w: Math.min(W, box.x + box.w + side) - cx,
+    h: Math.min(H, box.y + box.h + 2 * pad) - cy
+  }
+  return box
+}
+
+// Where the date is stamped on the sample photo.
+const SAMPLE_BOX = boxFromLine(17, 345, 124, 385, 408)
+
+// Find the date stamp by its yellow underline, scaling everything from the
+// line's length so any photo size works.
+function findDate(img) {
+  const W = img.naturalWidth,
+    H = img.naturalHeight
+  const c = document.createElement('canvas')
+  c.width = W
+  c.height = H
+  const ctx = c.getContext('2d', { willReadFrequently: true })
+  ctx.drawImage(img, 0, 0)
+  const d = ctx.getImageData(0, 0, W, H).data
+  const yellow = (i) => d[i] > 180 && d[i + 1] > 130 && d[i + 2] < 110 && d[i] - d[i + 2] > 110
+  const white = (i) => d[i] > 215 && d[i + 1] > 215 && d[i + 2] > 215
+
+  // Longest yellow run on each row, allowing 2px gaps.
+  const minLen = Math.max(20, W * 0.06)
+  const runs = new Array(H).fill(null)
+  for (let y = 0; y < H; y++) {
+    let best = null,
+      start = -1,
+      end = -1,
+      gap = 0
+    for (let x = 0; x <= W; x++) {
+      if (x < W && yellow((y * W + x) * 4)) {
+        if (start < 0) start = x
+        end = x
+        gap = 0
+      } else if (start >= 0 && (x === W || ++gap > 2)) {
+        if (!best || end - start + 1 > best.len) best = { x: start, len: end - start + 1 }
+        start = -1
+        gap = 0
+      }
+    }
+    if (best && best.len >= minLen) runs[y] = best
+  }
+
+  let found = null
+  for (let y0 = 0; y0 < H; y0++) {
+    if (!runs[y0] || runs[y0 - 1]) continue
+    // Group the rows of one line; on resized photos its edge rows are faint and
+    // shorter, so measure it from its longest row and start at the first solid one.
+    let thick = 1,
+      run = runs[y0]
+    while (runs[y0 + thick]) {
+      if (runs[y0 + thick].len > run.len) run = runs[y0 + thick]
+      thick++
+    }
+    let y = y0
+    while (runs[y].len < run.len * 0.8) y++
+    const k = run.len / 124
+    // A thin line, not a yellow area.
+    if (thick > Math.max(4, 4 * k)) continue
+    // White date text above it.
+    const top = Math.round(y - 22 * k),
+      bottom = Math.round(y - 6 * k)
+    if (top < 0) continue
+    let lit = 0,
+      total = 0
+    for (let ty = top; ty < bottom; ty++)
+      for (let tx = run.x; tx < run.x + run.len * 0.8 && tx < W; tx++, total++)
+        if (white((ty * W + tx) * 4)) lit++
+    if (lit / total < 0.04) continue
+    if (!found || run.len > found.len) found = { ...run, y }
+  }
+  return found ? boxFromLine(found.x, found.y, found.len, W, H) : null
+}
+
+// Find the old date's letters by brightness: the white text pixels and their
+// soft edges (as a mask to erase if the old date can't be read), plus where
+// the text starts, how tall it is and its colour.
+function findOldText(ctx, rect, k, near, maxEnd) {
+  const { x, y, w, h } = rect
+  if (w < 1 || h < 1) return {}
+  const img = ctx.getImageData(x, y, w, h)
+  const d = img.data
+  const lum = (i) => 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2]
+  const grey = (i) => Math.max(d[i], d[i + 1], d[i + 2]) - Math.min(d[i], d[i + 1], d[i + 2]) < 70
+
+  // A letter pixel is clearly brighter than the background around it. The
+  // background is taken as a darker-than-average level nearby (30th percentile),
+  // since soft, wide letters would pull a plain average up and hide themselves;
+  // comparing locally keeps bright walls or concrete from counting as text.
+  const L = new Float32Array(w * h)
+  for (let p = 0; p < w * h; p++) L[p] = lum(p * 4)
+  const r = Math.max(3, Math.round(4 * k))
+  const step = Math.max(1, Math.round(r / 3))
+  let mask = new Uint8Array(w * h)
+  // The solid middle of the strokes, without their soft glow: used to measure
+  // where the old date is and how tall, while `mask` (with the glow) is erased.
+  const solid = new Uint8Array(w * h)
+  const lift = new Float32Array(w * h)
+  const win = []
+  for (let cy = 0; cy < h; cy++)
+    for (let cx = 0; cx < w; cx++) {
+      win.length = 0
+      for (let wy = Math.max(0, cy - r); wy <= Math.min(h - 1, cy + r); wy += step)
+        for (let wx = Math.max(0, cx - r); wx <= Math.min(w - 1, cx + r); wx += step)
+          win.push(L[wy * w + wx])
+      win.sort((a, b) => a - b)
+      const p = cy * w + cx
+      lift[p] = L[p] - win[Math.floor(win.length * 0.3)]
+      if (L[p] > 120 && lift[p] > 14 && grey(p * 4)) mask[p] = 1
+    }
+  // "Solid" is relative to how strongly this photo's letters stand out (half
+  // of the strongest), so faint, soft letters still count.
+  const lifts = []
+  for (let p = 0; p < w * h; p++) if (mask[p]) lifts.push(lift[p])
+  lifts.sort((a, b) => b - a)
+  const strong = lifts.length ? lifts[Math.floor(lifts.length * 0.05)] : 0
+  const solidAt = Math.max(20, Math.min(32, strong / 2))
+  for (let p = 0; p < w * h; p++) if (mask[p] && lift[p] > solidAt) solid[p] = 1
+
+  // Drop tiny isolated specks (bright grit in the photo), keeping only blobs
+  // big enough to be part of a letter.
+  const minBlob = Math.max(3, Math.round(3 * k * k))
+  const seen = new Uint8Array(w * h)
+  for (let p = 0; p < w * h; p++) {
+    if (!mask[p] || seen[p]) continue
+    const blob = [p]
+    seen[p] = 1
+    for (let b = 0; b < blob.length; b++) {
+      const q = blob[b],
+        qx = q % w,
+        qy = (q - qx) / w
+      for (let dy = -1; dy <= 1; dy++)
+        for (let dx = -1; dx <= 1; dx++) {
+          const nx = qx + dx,
+            ny = qy + dy,
+            n = ny * w + nx
+          if (nx >= 0 && ny >= 0 && nx < w && ny < h && mask[n] && !seen[n]) {
+            seen[n] = 1
+            blob.push(n)
+          }
+        }
+    }
+    if (blob.length < minBlob) for (const q of blob) mask[q] = 0
+  }
+
+  // Where the old text starts, looking only a few pixels either side of where
+  // the line says it should (`near`): the first column with letter pixels that
+  // has more right after it, so a lone bright speck isn't taken for the start.
+  const cols = new Array(w).fill(0),
+    solidCols = new Array(w).fill(0)
+  for (let p = 0; p < w * h; p++) {
+    if (!mask[p]) solid[p] = 0
+    cols[p % w] += mask[p]
+    solidCols[p % w] += solid[p]
+  }
+  const reach = Math.max(2, Math.round(5 * k)),
+    run = Math.max(2, Math.round(2 * k)),
+    tall = Math.max(2, Math.round(4 * k))
+  let left = null
+  // The date never starts left of its underline (it starts ~1px in), so only
+  // look a pixel to the left: further out is background, and bright concrete
+  // there would otherwise be taken for the first digit.
+  const back = Math.max(1, Math.round(k))
+  if (near != null)
+    for (let cx = Math.max(0, near - x - back); cx <= Math.min(w - 1, near - x + reach); cx++)
+      // A date starts with a digit, whose stroke covers much of the text height.
+      if (solidCols[cx] >= tall && solidCols.slice(cx + 1, cx + 1 + run).some((n) => n >= 2)) {
+        left = x + cx
+        break
+      }
+
+  // Where the old text ends: walking right from its start, the last letter
+  // column before a gap wider than a space. Nothing outside the text's own
+  // span is touched, so bright things beside the date are left alone.
+  let start =
+    left != null ? left - x : near != null ? Math.max(0, near - x) : cols.findIndex((n) => n >= 2)
+  if (start < 0) start = 0
+  const gapEnd = Math.max(3, Math.round(5 * k))
+  let end = start
+  // ...never past the end of the line under it, and not into a solid bright
+  // area (a letter never fills its whole column top to bottom).
+  const last = maxEnd != null ? Math.min(w - 1, maxEnd - x) : w - 1
+  for (let cx = start; cx <= last && cx - end <= gapEnd; cx++) {
+    if (solidCols[cx] > 0.9 * h) break
+    if (solidCols[cx]) end = cx
+  }
+  const margin = Math.max(1, Math.round(k))
+  for (let cy = 0; cy < h; cy++)
+    for (let cx = 0; cx < w; cx++)
+      if (cx < start - margin || cx > end + margin) mask[cy * w + cx] = solid[cy * w + cx] = 0
+
+  // Only erase glow that sits right beside a solid stroke: a patch of concrete
+  // that is merely lighter than its surroundings has no solid stroke in it.
+  const near2 = Math.max(2, Math.round(2 * k))
+  const nearSolid = new Uint8Array(w * h)
+  for (let p = 0; p < w * h; p++) {
+    if (!solid[p]) continue
+    const px = p % w,
+      py = (p - px) / w
+    for (let dy = -near2; dy <= near2; dy++)
+      for (let dx = -near2; dx <= near2; dx++) {
+        const nx = px + dx,
+          ny = py + dy
+        if (nx >= 0 && ny >= 0 && nx < w && ny < h) nearSolid[ny * w + nx] = 1
+      }
+  }
+  for (let p = 0; p < w * h; p++) if (!nearSolid[p]) mask[p] = 0
+
+  // How tall the old digits are: the rows where the text is dense, giving its
+  // top and baseline. Only the date part is measured (the left ~45%, before
+  // the weekday): it is all digits, with no tails like the "y" in "Friday"
+  // to stretch the height, and less bright background mixed in.
+  const rowsN = new Array(h).fill(0)
+  const digitsEnd = start + Math.round((end - start) * 0.45)
+  for (let cy = 0; cy < h; cy++)
+    for (let cx = start; cx <= digitsEnd; cx++) rowsN[cy] += solid[cy * w + cx]
+  const dense = Math.max(...rowsN) * 0.35
+  const top = rowsN.findIndex((n) => n >= dense)
+  let base = h - 1
+  while (base > top && rowsN[base] < dense) base--
+
+  // The old letters' colour: the average of their brightest third (the middle
+  // of the strokes), so the new date can match it instead of being pure white.
+  const core = []
+  for (let p = 0; p < w * h; p++) if (mask[p]) core.push(p * 4)
+  core.sort((a, b) => lum(b) - lum(a))
+  let color = null
+  if (core.length >= 5) {
+    const bright = core.slice(0, Math.max(5, Math.round(core.length / 3)))
+    const avg = (c) => Math.round(bright.reduce((s, i) => s + d[i + c], 0) / bright.length)
+    color = `rgb(${avg(0)}, ${avg(1)}, ${avg(2)})`
+  }
+
+  // Grow the mask to take in the letters' anti-aliased edges and the faint
+  // dark shadow around them, so filling doesn't spread that shadow colour.
+  const grow = Math.max(2, Math.round(2 * k))
+  for (let n = 0; n < grow; n++) {
+    const next = mask.slice()
+    for (let cy = 0; cy < h; cy++)
+      for (let cx = 0; cx < w; cx++)
+        if (!mask[cy * w + cx])
+          for (let dy = -1; dy <= 1 && !next[cy * w + cx]; dy++)
+            for (let dx = -1; dx <= 1; dx++) {
+              const nx = cx + dx,
+                ny = cy + dy
+              if (nx >= 0 && ny >= 0 && nx < w && ny < h && mask[ny * w + nx]) {
+                next[cy * w + cx] = 1
+                break
+              }
+            }
+    mask = next
+  }
+
+  return {
+    mask,
+    lift,
+    solidAt,
+    color,
+    left,
+    top: top >= 0 ? y + top : null,
+    base: top >= 0 ? y + base : null
+  }
+}
+
+// Fill the masked pixels (in `rect`) by copying small patches of real photo
+// from close by, edge inwards, each time picking the patch that best matches
+// what is already around the hole. Unlike averaging colours, this carries on
+// edges, shadows and texture (concrete, bricks, grass) behind the old date.
+// Patches are never taken from the stamp's yellow line or slate-blue time
+// boxes. Returns the mask of any pixels it couldn't fill.
+// Yellow (the line and its soft edge) or slate blue (the time boxes). The blue
+// must lean clearly away from green too: teal foliage also has more blue than
+// red, and treating it as stamp leaves nothing to fill from.
+const isStampColor = (r, g, b) => (r - b > 50 && g - b > 35) || (b - r > 15 && b - g > 8)
+
+function patchFill(ctx, rect, mask, k) {
+  const W = ctx.canvas.width,
+    H = ctx.canvas.height
+  const margin = Math.round(8 * k)
+  const X = Math.max(0, rect.x - margin),
+    Y = Math.max(0, rect.y - margin)
+  const RW = Math.min(W, rect.x + rect.w + margin) - X,
+    RH = Math.min(H, rect.y + rect.h + margin) - Y
+  const img = ctx.getImageData(X, Y, RW, RH)
+  const d = img.data
+  const N = RW * RH
+  const known = new Uint8Array(N).fill(1)
+  let holes = 0
+  for (let cy = 0; cy < rect.h; cy++)
+    for (let cx = 0; cx < rect.w; cx++)
+      if (mask[cy * rect.w + cx]) {
+        known[(cy + rect.y - Y) * RW + cx + rect.x - X] = 0
+        holes++
+      }
+  if (!holes) return mask
+
+  // Pixels that belong to the stamp, not the photo.
+  const stamp = new Uint8Array(N)
+  for (let p = 0, i = 0; p < N; p++, i += 4) {
+    const r = d[i],
+      g = d[i + 1],
+      b = d[i + 2]
+    if (isStampColor(r, g, b)) stamp[p] = 1
+  }
+
+  // Photo pixels that can be copied from: outside the hole and not stamp.
+  const photo = new Uint8Array(N)
+  for (let p = 0; p < N; p++) photo[p] = known[p] && !stamp[p] ? 1 : 0
+
+  // Each step matches a wide patch (`pr`) around the hole's edge, so lines
+  // like cracks and shadow edges are followed, but copies only its small
+  // centre (`cr`), so copied squares don't show as tiles. The wide patch may
+  // overlap the stamp (the date sits tight between the time boxes and the
+  // line); those pixels are just left out of the comparison.
+  const pr = Math.max(3, Math.round(3 * k)),
+    cr = Math.max(1, Math.round(k))
+  const source = new Uint8Array(N)
+  {
+    // Centres whose copied part is all photo, via an integral image.
+    const S = new Int32Array((RW + 1) * (RH + 1))
+    for (let cy = 0; cy < RH; cy++)
+      for (let cx = 0, row = 0; cx < RW; cx++) {
+        row += photo[cy * RW + cx] ? 0 : 1
+        S[(cy + 1) * (RW + 1) + cx + 1] = S[cy * (RW + 1) + cx + 1] + row
+      }
+    for (let cy = cr; cy < RH - cr; cy++)
+      for (let cx = cr; cx < RW - cr; cx++) {
+        const x0 = cx - cr,
+          y0 = cy - cr,
+          x1 = cx + cr + 1,
+          y1 = cy + cr + 1
+        const bad =
+          S[y1 * (RW + 1) + x1] -
+          S[y0 * (RW + 1) + x1] -
+          S[y1 * (RW + 1) + x0] +
+          S[y0 * (RW + 1) + x0]
+        if (!bad) source[cy * RW + cx] = 1
+      }
+  }
+
+  const reachX = Math.round(30 * k),
+    reachY = Math.round(14 * k)
+  // On big photos, search on a coarse grid first, then refine around the best.
+  const stride = Math.max(1, Math.round(k))
+  // How many known photo pixels are in the patch around each hole pixel:
+  // holes most surrounded by photo are filled first.
+  const countKnown = (cx, cy) => {
+    let n = 0
+    for (let dy = -pr; dy <= pr; dy++)
+      for (let dx = -pr; dx <= pr; dx++) {
+        const nx = cx + dx,
+          ny = cy + dy
+        if (nx >= 0 && ny >= 0 && nx < RW && ny < RH) {
+          const q = ny * RW + nx
+          if (known[q] && !stamp[q]) n++
+        }
+      }
+    return n
+  }
+  // How well the patch at (sx, sy) matches the one around (tx, ty): average
+  // colour difference over pixels that are photo in both, plus a slight
+  // preference for close patches. Infinity if too little overlaps to judge.
+  const area = (2 * pr + 1) * (2 * pr + 1)
+  const patchCost = (tx, ty, sx, sy, need, limit) => {
+    let cost = 0,
+      n = 0
+    for (let dy = -pr; dy <= pr; dy++) {
+      const ny = ty + dy,
+        my = sy + dy
+      if (ny < 0 || ny >= RH || my < 0 || my >= RH) continue
+      for (let dx = -pr; dx <= pr; dx++) {
+        const nx = tx + dx,
+          mx = sx + dx
+        if (nx < 0 || nx >= RW || mx < 0 || mx >= RW) continue
+        const q = ny * RW + nx,
+          s = my * RW + mx
+        if (!known[q] || stamp[q] || !photo[s]) continue
+        const i = q * 4,
+          j = s * 4
+        const dr = d[i] - d[j],
+          dg = d[i + 1] - d[j + 1],
+          db = d[i + 2] - d[j + 2]
+        cost += dr * dr + dg * dg + db * db
+        n++
+      }
+      // Already worse than the best so far, however many pixels are left.
+      if (cost > limit * area) return Infinity
+    }
+    if (n < need) return Infinity
+    return cost / n + (Math.hypot(sx - tx, (sy - ty) * 2) / k) * 4
+  }
+
+  for (let guard = 0; holes > 0 && guard < N; guard++) {
+    // The hole pixel on the edge with the most known pixels around it.
+    let best = -1,
+      bestN = -1
+    for (let p = 0; p < N; p++) {
+      if (known[p]) continue
+      const cx = p % RW,
+        cy = (p - cx) / RW
+      const edge =
+        (cx > 0 && known[p - 1]) ||
+        (cx < RW - 1 && known[p + 1]) ||
+        (cy > 0 && known[p - RW]) ||
+        (cy < RH - 1 && known[p + RW])
+      if (!edge) continue
+      const n = countKnown(cx, cy)
+      if (n > bestN) {
+        bestN = n
+        best = p
+      }
+    }
+    if (best < 0) break
+    const tx = best % RW,
+      ty = (best - tx) / RW
+
+    // The nearby source patch that best matches the known pixels around it.
+    const need = Math.max(4, Math.round(bestN * 0.5))
+    let src = -1,
+      srcCost = Infinity
+    const consider = (sx, sy) => {
+      if (sx < 0 || sy < 0 || sx >= RW || sy >= RH || !source[sy * RW + sx]) return
+      const c = patchCost(tx, ty, sx, sy, need, srcCost)
+      if (c < srcCost) {
+        srcCost = c
+        src = sy * RW + sx
+      }
+    }
+    for (let sy = Math.max(cr, ty - reachY); sy < Math.min(RH - cr, ty + reachY + 1); sy += stride)
+      for (
+        let sx = Math.max(cr, tx - reachX);
+        sx < Math.min(RW - cr, tx + reachX + 1);
+        sx += stride
+      )
+        consider(sx, sy)
+    if (src >= 0 && stride > 1) {
+      const bx = src % RW,
+        by = (src - bx) / RW
+      for (let dy = -stride + 1; dy < stride; dy++)
+        for (let dx = -stride + 1; dx < stride; dx++) if (dx || dy) consider(bx + dx, by + dy)
+    }
+    if (src < 0) break
+    const sx = src % RW,
+      sy = (src - sx) / RW
+    for (let dy = -cr; dy <= cr; dy++)
+      for (let dx = -cr; dx <= cr; dx++) {
+        const nx = tx + dx,
+          ny = ty + dy
+        if (nx < 0 || ny < 0 || nx >= RW || ny >= RH) continue
+        const q = ny * RW + nx
+        if (known[q]) continue
+        const i = q * 4,
+          j = ((sy + dy) * RW + sx + dx) * 4
+        d[i] = d[j]
+        d[i + 1] = d[j + 1]
+        d[i + 2] = d[j + 2]
+        known[q] = 1
+        holes--
+      }
+  }
+  ctx.putImageData(img, X, Y)
+
+  const left = new Uint8Array(rect.w * rect.h)
+  for (let cy = 0; cy < rect.h; cy++)
+    for (let cx = 0; cx < rect.w; cx++)
+      if (!known[(cy + rect.y - Y) * RW + cx + rect.x - X]) left[cy * rect.w + cx] = 1
+  return left
+}
+
+// Fill the masked pixels (in `rect`) from the photo around them, keeping the
+// photo's grain, and leave every other pixel exactly as it was.
+function fillErased(ctx, rect, mask, k) {
+  const { x, y, w, h } = rect
+  if (w < 1 || h < 1) return
+  // Copy real texture in first; anything that couldn't be filled that way is
+  // blended in from its neighbours below.
+  mask = patchFill(ctx, rect, mask, k)
+  if (!mask.some((v) => v)) return
+  const img = ctx.getImageData(x, y, w, h)
+  const d = img.data
+  const grey = (i) => Math.max(d[i], d[i + 1], d[i + 2]) - Math.min(d[i], d[i + 1], d[i + 2]) < 70
+  const erased = mask.slice()
+  const orig = d.slice()
+  // Don't borrow colour from the stamp's slate-blue time boxes, which can sit
+  // right above the date; only from the photo behind it (unless nothing else
+  // is left to borrow from).
+  const avoid = new Uint8Array(w * h)
+  for (let p = 0; p < w * h; p++) {
+    const r = d[p * 4],
+      g = d[p * 4 + 1],
+      b = d[p * 4 + 2]
+    if (b - r > 15 && b - g > 8) avoid[p] = 1
+  }
+  let useAvoided = false
+
+  // Fill from the outside in: each pass paints masked pixels that touch a known
+  // pixel with the average of those neighbours.
+  for (let left = mask.reduce((a, b) => a + b, 0); left > 0;) {
+    const fill = []
+    for (let cy = 0; cy < h; cy++)
+      for (let cx = 0; cx < w; cx++) {
+        if (!mask[cy * w + cx]) continue
+        let r = 0,
+          g = 0,
+          b = 0,
+          n = 0
+        for (let dy = -1; dy <= 1; dy++)
+          for (let dx = -1; dx <= 1; dx++) {
+            const nx = cx + dx,
+              ny = cy + dy
+            if (nx < 0 || ny < 0 || nx >= w || ny >= h || mask[ny * w + nx]) continue
+            if (avoid[ny * w + nx] && !useAvoided) continue
+            const i = (ny * w + nx) * 4
+            r += d[i]
+            g += d[i + 1]
+            b += d[i + 2]
+            n++
+          }
+        if (n) fill.push(cy * w + cx, r / n, g / n, b / n)
+      }
+    if (!fill.length) {
+      if (useAvoided) break
+      useAvoided = true
+      continue
+    }
+    for (let f = 0; f < fill.length; f += 4) {
+      const p = fill[f]
+      d[p * 4] = fill[f + 1]
+      d[p * 4 + 1] = fill[f + 2]
+      d[p * 4 + 2] = fill[f + 3]
+      mask[p] = 0
+      avoid[p] = 0
+    }
+    left -= fill.length / 4
+  }
+
+  // That fill is perfectly smooth, which shows up as a smudge on grainy
+  // backgrounds. Give each filled pixel the grain of a nearby untouched one:
+  // how much that pixel differs from its own 3x3 neighbourhood.
+  const olum = (i) => 0.299 * orig[i] + 0.587 * orig[i + 1] + 0.114 * orig[i + 2]
+  const grain = (p) => {
+    const px = p % w,
+      py = (p - px) / w
+    let s = 0,
+      n = 0
+    for (let dy = -1; dy <= 1; dy++)
+      for (let dx = -1; dx <= 1; dx++) {
+        const nx = px + dx,
+          ny = py + dy
+        if (nx >= 0 && ny >= 0 && nx < w && ny < h) {
+          s += olum((ny * w + nx) * 4)
+          n++
+        }
+      }
+    return olum(p * 4) - s / n
+  }
+  const reachG = Math.max(4, Math.round(6 * k))
+  let seed = 12345
+  const rand = (n) => {
+    seed = (seed * 1103515245 + 12345) & 0x7fffffff
+    return seed % n
+  }
+  for (let p = 0; p < w * h; p++) {
+    if (!erased[p]) continue
+    const px = p % w,
+      py = (p - px) / w
+    for (let t = 0; t < 12; t++) {
+      const sx = px + rand(2 * reachG + 1) - reachG,
+        sy = py + rand(2 * reachG + 1) - reachG
+      if (sx < 0 || sy < 0 || sx >= w || sy >= h) continue
+      const q = sy * w + sx
+      if (erased[q] || !grey(q * 4) || orig[q * 4 + 2] - orig[q * 4] > 15) continue
+      const g = grain(q),
+        i = p * 4
+      for (let c = 0; c < 3; c++) d[i + c] = Math.max(0, Math.min(255, d[i + c] + g))
+      break
+    }
+  }
+
+  ctx.putImageData(img, x, y)
+}
+
+// Tools for matching the old date's text against the photo. Its digits are
+// drawn in the same font as the new date, at the old date's left edge, height
+// and baseline (or at a given `capH` and `base` instead, to try other sizes);
+// `sx` is how much the text is squeezed sideways.
+function stampMatcher(found, rect, capH, base) {
+  const { lift, left } = found
+  base = base ?? found.base
+  capH = capH ?? (found.top != null ? found.base - found.top + 1 : null)
+  if (left == null || base == null || !(capH >= 5)) return null
+  const top = base - capH + 1
+  const { x, y, w, h } = rect
+  const c = document.createElement('canvas')
+  c.width = w
+  c.height = h
+  const cc = c.getContext('2d', { willReadFrequently: true })
+  cc.font = FONT
+  const size = (100 * capH) / cc.measureText('0123456789').actualBoundingBoxAscent
+  const font = FONT.replace('100px', size + 'px')
+  cc.font = font
+  const bearing = cc.measureText('0').actualBoundingBoxLeft
+  // How much each pixel looks like the solid middle of a letter (0..1), from
+  // how much it stands out; the letters' soft glow is left out, as it would
+  // make bigger text look like a better fit.
+  const solidAt = found.solidAt ?? 25
+  const obs = new Float32Array(w * h)
+  for (let p = 0; p < w * h; p++) obs[p] = Math.max(0, Math.min(1, (lift[p] - solidAt) / 20))
+
+  // Draw `text` and return its coverage, optionally offset by `prefix`'s width.
+  const render = (text, sx, prefix = '', dx = 0) => {
+    cc.setTransform(1, 0, 0, 1, 0, 0)
+    cc.clearRect(0, 0, w, h)
+    cc.translate(left - x + dx, base + 1 - y)
+    cc.scale(sx, 1)
+    cc.font = font
+    cc.fillStyle = '#fff'
+    cc.fillText(text, bearing + (prefix ? cc.measureText(prefix).width : 0), 0)
+    return cc.getImageData(0, 0, w, h).data
+  }
+  // A good fit puts strokes on text-like pixels and gaps on background, over
+  // the columns the drawn text covers.
+  const score = (a, rows = [top - y, base - y], gapWeight = 1) => {
+    let x0 = w,
+      x1 = -1
+    for (let p = 0; p < w * h; p++)
+      if (a[p * 4 + 3] > 20) {
+        x0 = Math.min(x0, p % w)
+        x1 = Math.max(x1, p % w)
+      }
+    if (x1 < 0) return -Infinity
+    let s = 0
+    for (let cy = rows[0]; cy <= rows[1]; cy++)
+      for (let cx = x0; cx <= x1; cx++) {
+        const p = cy * w + cx,
+          v = a[p * 4 + 3] / 255
+        s += v * (obs[p] - 0.5) + (1 - v) * (0.5 - obs[p]) * gapWeight
+      }
+    return s
+  }
+  // How well drawn text matches over the whole area: text-like pixels it
+  // covers count for it and background it covers against. Unlike `score`,
+  // this compares fairly between different sizes.
+  // (A correlation: text that is too big gets marked down for the background
+  // it covers just as text that is too small does for the letters it misses,
+  // and the letters' soft glow doesn't favour bigger sizes.)
+  let so = 0,
+    soo = 0
+  for (let p = 0; p < w * h; p++) {
+    so += obs[p]
+    soo += obs[p] * obs[p]
+  }
+  const n = w * h,
+    varO = soo - (so * so) / n
+  const cover = (a) => {
+    let sv = 0,
+      svv = 0,
+      svo = 0
+    for (let p = 0; p < n; p++) {
+      const v = a[p * 4 + 3]
+      if (!v) continue
+      const f = v / 255
+      sv += f
+      svv += f * f
+      svo += f * obs[p]
+    }
+    const varV = svv - (sv * sv) / n
+    if (varV <= 0 || varO <= 0) return -Infinity
+    return (svo - (sv * so) / n) / Math.sqrt(varV * varO)
+  }
+  return { render, score, cover, capH, w, h, y, top, base }
+}
+
+const SQUEEZES = [0.7, 0.72, 0.74, 0.76, 0.78, 0.8, 0.82, 0.84, 0.86, 0.88, 0.9]
+const stampText = (d) =>
+  String(d.getUTCDate()).padStart(2, '0') +
+  '-' +
+  String(d.getUTCMonth() + 1).padStart(2, '0') +
+  '-' +
+  d.getUTCFullYear()
+
+// Fit a known old date (YYYY-MM-DD) to the photo: find how big it is, where
+// its baseline sits and how squeezed it was, and return the exact shape of
+// its letters, spread by a pixel or so to take in their soft edges, so only
+// those pixels get erased. Photos differ (snipped at different sizes, or
+// stretched in PowerPoint), so the size is found on each photo by trying the
+// real text at a range of heights around what the yellow line suggests
+// (`lineBox`), not assumed.
+function fitOldDate(found, rect, isoDate, lineBox, trustLine = true) {
+  const d = new Date(isoDate + 'T00:00:00Z')
+  if (found.left == null || isNaN(d)) return null
+  const label = stampText(d) + ' ' + weekday.format(d)
+  const lineH = lineBox.h,
+    lineBase = lineBox.y + lineBox.h - 1
+  const k = lineH / 13
+  const near = Math.max(2, Math.round(2 * k))
+  const shift = Math.max(1, Math.round(2 * k))
+  const bases = new Set()
+  for (let b = -Math.round(1.5 * near); b <= Math.round(1.5 * near); b++) {
+    bases.add(lineBase + b)
+    if (found.base != null) bases.add(found.base + b)
+  }
+  const at = (capH, base) => {
+    const top = base - capH + 1
+    if (top < rect.y || base > rect.y + rect.h - 1) return null
+    return stampMatcher(found, rect, capH, base)
+  }
+  const tryFit = (m, sx, dx) => {
+    const a = m.render(label, sx, '', dx)
+    return { m, sx, dx, a, s: m.cover(a) }
+  }
+  let best = null
+  const keep = (f) => {
+    if (f && (!best || f.s > best.s)) best = f
+  }
+  // The text's width is known well from the line's length, so when trying a
+  // taller or shorter size, squeeze it to keep that width: a photo stretched
+  // taller has taller letters, not wider ones.
+  const squeezeFor = (capH, sx = NARROW) => (sx * lineH) / capH
+  // 1. Where the baseline is, at the size the line suggests...
+  for (const base of bases) {
+    const m = at(lineH, base)
+    if (m) keep(tryFit(m, NARROW, 0))
+  }
+  if (!best) return null
+  // ...then the size, with the baseline near there.
+  const b1 = best.m.base
+  for (let capH = Math.round(lineH * 0.75); capH <= Math.round(lineH * 1.35); capH++)
+    for (let db = -near; db <= near; db++) {
+      const m = capH !== lineH || db ? at(capH, b1 + db) : null
+      if (m) keep(tryFit(m, squeezeFor(capH), 0))
+    }
+  // 2. Squeeze, then a small sideways shift (in case the measured start of
+  // the old text is a little off), at that size.
+  const m2 = best.m
+  for (const sx of SQUEEZES) keep(tryFit(m2, squeezeFor(m2.capH, sx), 0))
+  const sx2 = best.sx
+  for (let dx = -shift; dx <= shift; dx++) if (dx) keep(tryFit(m2, sx2, dx))
+  // 3. Fine-tune size and baseline with that squeeze.
+  const { sx, dx } = best
+  const c0 = best.m.capH,
+    b0 = best.m.base
+  for (let dc = -1; dc <= 1; dc++)
+    for (let db = -1; db <= 1; db++) {
+      const m = (dc || db) && at(c0 + dc, b0 + db)
+      if (m) keep(tryFit(m, (sx * c0) / (c0 + dc), dx))
+    }
+  // On a photo that isn't stretched, the line gives the size exactly, while
+  // the fit can be a pixel out; so a size within about a pixel of the line's
+  // is taken as the line's (unless the box was drawn by hand).
+  if (trustLine && Math.abs(best.m.capH - lineH) <= Math.max(1, Math.round(0.08 * lineH))) {
+    const c = best.m.capH,
+      fitted = best
+    best = null
+    for (let db = -1; db <= 1; db++) {
+      const m = at(lineH, fitted.m.base + db)
+      if (m) keep(tryFit(m, (fitted.sx * c) / lineH, fitted.dx))
+    }
+    if (!best) best = fitted
+  }
+  const { w, h } = best.m
+  let shape = new Uint8Array(w * h)
+  for (let p = 0; p < w * h; p++) if (best.a[p * 4 + 3] > 20) shape[p] = 1
+  for (let n = 0; n < Math.max(1, Math.round(1.5 * k)); n++) {
+    const next = shape.slice()
+    for (let p = 0; p < w * h; p++) {
+      if (shape[p]) continue
+      const px = p % w,
+        py = (p - px) / w
+      if (
+        (px > 0 && shape[p - 1]) ||
+        (px < w - 1 && shape[p + 1]) ||
+        (py > 0 && shape[p - w]) ||
+        (py < h - 1 && shape[p + w])
+      )
+        next[p] = 1
+    }
+    shape = next
+  }
+  return {
+    shape,
+    sx: best.sx,
+    dx: best.dx,
+    top: best.m.top,
+    capH: best.m.capH
+  }
+}
+
+// Write the label the way the stamp app does: in its font and in the old
+// date's colour, with the digits filling the box height and the text sitting
+// on the box's bottom edge. `narrow` is how much the old date was squeezed,
+// when it could be read. A heavier `weight` only thickens the strokes: size,
+// letter positions and overall width all stay exactly as at Regular (400).
+function drawLabel(ctx, box, label, color = '#fff', narrow = NARROW, weight = 400) {
+  ctx.save()
+  ctx.font = FONT
+  const m = ctx.measureText(label)
+  const size = (100 * box.h) / ctx.measureText('0123456789').actualBoundingBoxAscent
+  const regular = FONT.replace('100px', size + 'px')
+  ctx.font = regular
+  const width = (m.width * size) / 100
+  ctx.translate(box.x, box.y + box.h)
+  ctx.scale(Math.min(narrow, box.w / width), 1)
+  ctx.fillStyle = color
+  ctx.textBaseline = 'alphabetic'
+  const start = (m.actualBoundingBoxLeft * size) / 100
+  if (weight === 400) ctx.fillText(label, start, 0)
+  else {
+    // Lay the letters out with Regular's spacing, then draw each one in the
+    // heavier weight centred on where its Regular letter would be.
+    // (Positions come from the width of everything before each letter, so
+    // kerning is kept.)
+    const heavy = withWeight(regular, weight)
+    for (let i = 0; i < label.length; i++) {
+      const ch = label[i]
+      ctx.font = regular
+      const x = start + ctx.measureText(label.slice(0, i)).width
+      const adv = ctx.measureText(ch).width
+      ctx.font = heavy
+      ctx.fillText(ch, x + (adv - ctx.measureText(ch).width) / 2, 0)
+    }
+  }
+  ctx.restore()
+}
+
+
+
+// ---- Page wiring (mirrors the app's PhotoDateEditor component) ----
+const $ = (id) => document.getElementById(id)
+const state = { photo: null, autoBox: null, manualBox: null, fontReady: false, label: '' }
+$('newDate').value = new Date().toISOString().slice(0, 10)
+
+Promise.all([...new Set(Object.values(WEIGHT))].map((w) => document.fonts.load(withWeight(FONT, w))))
+  .catch(() => {})
+  .then(() => { state.fontReady = true; render() })
+
+function setStatus(t) { $('status').textContent = t }
+
+function loadFile(file) {
+  if (!file || !file.type.startsWith('image/')) return
+  const url = URL.createObjectURL(file)
+  loadImage(url)
+    .then((img) => {
+      state.photo = img
+      state.autoBox = findDate(img)
+      state.manualBox = null
+      $('manual').checked = !state.autoBox
+      render()
+    })
+    .catch(() => setStatus('That file could not be opened as an image.'))
+}
+
+function render() {
+  const photo = state.photo
+  if (!photo || !state.fontReady) return
+  const manual = $('manual').checked
+  const box = manual ? state.manualBox : state.autoBox
+  const scale = +$('scale').value
+  const date = $('newDate').value
+  const oldDate = $('oldDate').value
+  const before = $('before'), canvas = $('after')
+  before.width = photo.naturalWidth
+  before.height = photo.naturalHeight
+  before.getContext('2d').drawImage(photo, 0, 0)
+  before.classList.toggle('drawing', manual)
+  const work = document.createElement('canvas')
+  work.width = photo.naturalWidth
+  work.height = photo.naturalHeight
+  const wctx = work.getContext('2d', { willReadFrequently: true })
+  wctx.drawImage(photo, 0, 0)
+  canvas.width = photo.naturalWidth * scale
+  canvas.height = photo.naturalHeight * scale
+  const ctx = canvas.getContext('2d')
+  ctx.imageSmoothingQuality = 'high'
+  const enlarge = () => ctx.drawImage(work, 0, 0, canvas.width, canvas.height)
+  enlarge()
+  $('download').disabled = $('copy').disabled = true
+  if (!date) return setStatus('Choose a valid date.')
+  if (!box) return setStatus(manual
+    ? 'Drag a box over the old date on the Before photo.'
+    : "Couldn't find the date on this photo. Tick “Draw the box myself” and drag over it.")
+  const [year, month, day] = date.split('-')
+  const label = day + '-' + month + '-' + year + ' ' + weekday.format(new Date(date))
+  state.label = label
+  const rect = box.clear || box
+  const old = findOldText(wctx, rect, box.h / 13, box.x, box.x + box.w)
+  const read = old.mask && oldDate ? fitOldDate(old, rect, oldDate, box, !manual) : null
+  if (old.mask) fillErased(wctx, rect, read ? read.shape : old.mask, box.h / 13)
+  enlarge()
+  const s = scale
+  const lineStart = box.x - Math.max(1, Math.round(box.h / 13))
+  const x = Math.max(lineStart, old.left != null ? old.left + (read?.dx ?? 0) : box.x)
+  const measured = old.top != null ? old.base - old.top + 1 : 0
+  const ratio = measured / box.h
+  const fits = ratio > 0.7 && ratio < 1.4 && (manual || ratio < 0.8 || ratio > 1.25)
+  const ty = read ? read.top : fits ? old.top : box.y,
+    th = read ? read.capH : fits ? measured : box.h
+  drawLabel(ctx, { x: x * s, y: ty * s, w: (box.w + box.x - x) * s, h: th * s }, label,
+    old.color || undefined, read?.sx, WEIGHT[s] || 400)
+  $('download').disabled = $('copy').disabled = false
+  setStatus(label + (oldDate ? '' : ' · Tip: fill in “Date on the photo now” for a cleaner result.'))
+}
+
+// Inputs
+$('pick').onclick = () => $('file').click()
+$('file').onchange = (e) => loadFile(e.target.files[0])
+for (const id of ['oldDate', 'newDate', 'scale', 'manual']) $(id).addEventListener('change', render)
+document.addEventListener('paste', (e) => {
+  const d = e.clipboardData
+  const f = [...(d?.files || [])].find((f) => f.type.startsWith('image/')) ||
+    [...(d?.items || [])].find((i) => i.type.startsWith('image/'))?.getAsFile()
+  if (f) { e.preventDefault(); loadFile(f) }
+})
+const drop = $('drop')
+drop.addEventListener('dragover', (e) => { e.preventDefault(); drop.classList.add('over') })
+drop.addEventListener('dragleave', () => drop.classList.remove('over'))
+drop.addEventListener('drop', (e) => { e.preventDefault(); drop.classList.remove('over'); loadFile(e.dataTransfer.files[0]) })
+
+// Download / copy
+let downloadsApi = null
+window.claude?.use?.('downloads').then((d) => { downloadsApi = d }).catch(() => {})
+$('download').onclick = () => $('after').toBlob(async (b) => {
+  if (downloadsApi) {
+    try { await downloadsApi.save({ filename: 'dated-photo.png', data: b }) }
+    catch (e) { if (e?.code !== 'declined') setStatus(state.label + ' · Download was blocked. Right-click the After photo and choose Save image.') }
+    return
+  }
+  const a = document.createElement('a')
+  a.href = URL.createObjectURL(b)
+  a.download = 'dated-photo.png'
+  a.click()
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000)
+}, 'image/png')
+$('copy').onclick = async () => {
+  try {
+    const blob = await new Promise((r) => $('after').toBlob(r, 'image/png'))
+    await navigator.clipboard.write([new ClipboardItem({ 'image/png': blob })])
+    setStatus(state.label + ' · Copied.')
+  } catch {
+    setStatus(state.label + ' · Copying was blocked. Right-click the After photo and choose Copy image.')
+  }
+}
+
+// Drawing the box by hand on the Before photo
+let drag = null
+const before = $('before'), sel = $('sel')
+const toPhoto = (e) => {
+  const r = before.getBoundingClientRect()
+  return {
+    x: Math.max(0, Math.min(before.width, ((e.clientX - r.left) / r.width) * before.width)),
+    y: Math.max(0, Math.min(before.height, ((e.clientY - r.top) / r.height) * before.height))
+  }
+}
+const showSel = () => {
+  if (!drag) return (sel.style.display = 'none')
+  const k = before.getBoundingClientRect().width / before.width
+  Object.assign(sel.style, {
+    display: 'block',
+    left: Math.min(drag.x0, drag.x1) * k + 'px', top: Math.min(drag.y0, drag.y1) * k + 'px',
+    width: Math.abs(drag.x1 - drag.x0) * k + 'px', height: Math.abs(drag.y1 - drag.y0) * k + 'px'
+  })
+}
+before.addEventListener('pointerdown', (e) => {
+  if (!state.photo || !$('manual').checked) return
+  before.setPointerCapture(e.pointerId)
+  const p = toPhoto(e)
+  drag = { x0: p.x, y0: p.y, x1: p.x, y1: p.y }
+  showSel()
+})
+before.addEventListener('pointermove', (e) => {
+  if (!drag) return
+  const p = toPhoto(e)
+  drag.x1 = p.x; drag.y1 = p.y
+  showSel()
+})
+before.addEventListener('pointerup', () => {
+  if (!drag) return
+  const b = {
+    x: Math.round(Math.min(drag.x0, drag.x1)), y: Math.round(Math.min(drag.y0, drag.y1)),
+    w: Math.round(Math.abs(drag.x1 - drag.x0)), h: Math.round(Math.abs(drag.y1 - drag.y0))
+  }
+  drag = null
+  showSel()
+  if (b.w < 4 || b.h < 4) return
+  // The drawn box covers the whole date, tails included; the digits fill its top 13/17.
+  state.manualBox = { ...b, h: Math.round((b.h * 13) / 17), clear: b }
+  render()
+})
+</script>
+</body>
+</html>
